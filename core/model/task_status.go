@@ -1,16 +1,13 @@
 package model
 
 import (
-	"context"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 type TaskStatus string
 
 const (
-	TaskStatusNotExist       TaskStatus = "not_exist"
+	TaskStatusNotExist       TaskStatus = "not_exist" // It is a virtual state used to mark that the task does not exist for deletion processing.
 	TaskStatusWaitScheduling TaskStatus = "wait_scheduling"
 	TaskStatusWaitRunning    TaskStatus = "wait_running"
 	TaskStatusRunning        TaskStatus = "running"
@@ -21,7 +18,6 @@ const (
 	TaskStatusFailed         TaskStatus = "failed"
 	TaskStatusStop           TaskStatus = "stop"
 
-	// 调度异常
 	TaskStatusExecptionRun   TaskStatus = "execption_run"
 	TaskStatusExecptionPause TaskStatus = "execption_pause"
 	TaskStatusExecptionStop  TaskStatus = "execption_stop"
@@ -44,7 +40,7 @@ func (ts TaskStatus) IsFinalStatus() bool {
 }
 
 func (ts TaskStatus) CanTransition(nextStatus TaskStatus) error {
-	_, err := GetTaskStatusTransitionFunc(ts, nextStatus)
+	_, err := GetChangeFunc(ts, nextStatus)
 	return err
 }
 
@@ -59,32 +55,4 @@ func (ts TaskStatus) PreWaitStatus() TaskStatus {
 		return TaskStatusWaitRunning
 	}
 	return ""
-}
-
-type TransitionFunc func(ctx context.Context, taskKey string) error
-
-var transitionFuncsMap = make(map[TaskStatus]map[TaskStatus]TransitionFunc)
-
-// TODO 使用db存储
-func RegisterTransitionFunc(from, to TaskStatus, fn TransitionFunc) {
-	if _, ok := transitionFuncsMap[from]; !ok {
-		transitionFuncsMap[from] = make(map[TaskStatus]TransitionFunc)
-	}
-
-	transitionFuncsMap[from][to] = fn
-}
-
-func GetTaskStatusTransitionFunc(
-	realRunStatus, wantRunStatus TaskStatus,
-) (TransitionFunc, error) {
-	m, ok := transitionFuncsMap[realRunStatus]
-	if !ok {
-		return nil, errors.Errorf("当前状态为[%s], 不支持转换", realRunStatus)
-	}
-	fid, ok := m[wantRunStatus]
-	if !ok {
-		return nil, errors.Errorf("当前状态[%s] -> 期望运行状态[%s], 不支持转换", realRunStatus, wantRunStatus)
-	}
-
-	return fid, nil
 }

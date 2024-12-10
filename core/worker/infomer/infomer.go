@@ -2,6 +2,7 @@ package infomer
 
 import (
 	"context"
+	"encoding/json"
 	"sync/atomic"
 	"time"
 
@@ -9,24 +10,32 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/xyzbit/minitaskx/core/model"
+	"github.com/xyzbit/minitaskx/internal/queque"
 )
 
 type Infomer struct {
 	id      string
 	running atomic.Bool
 
-	indexer *Indexer
-	loader  recordLoader
+	indexer      *Indexer
+	loader       recordLoader
+	changeQueque queque.TypedInterface[*model.Change]
 
 	opts *options
 }
 
-func New(id string, indexer *Indexer, loader recordLoader, opts ...Option) *Infomer {
+func New(
+	id string,
+	indexer *Indexer,
+	loader recordLoader,
+	opts ...Option,
+) *Infomer {
 	return &Infomer{
-		id:      id,
-		indexer: indexer,
-		loader:  loader,
-		opts:    newOptions(opts...),
+		id:           id,
+		indexer:      indexer,
+		loader:       loader,
+		changeQueque: queque.NewTyped[*model.Change](),
+		opts:         newOptions(opts...),
 	}
 }
 
@@ -41,50 +50,104 @@ func (i *Infomer) Run(ctx context.Context) error {
 		return err
 	}
 
-	// compare task has changed
-	execTicker := time.NewTicker(i.opts.runInterval)
-	defer execTicker.Stop()
+	// compare task's change and enqueue.
+	go i.enqueueIfTaskChange(ctx)
+
+	// monitor exit signal.
+	<-ctx.Done()
+	return i.shutdown()
+}
+
+// graceful shutdown.
+func (i *Infomer) shutdown() error {
+	stopCtx := context.Background()
+	if i.opts.shutdownTimeout > 0 {
+		var cancel context.CancelFunc
+		stopCtx, cancel = context.WithTimeout(stopCtx, i.opts.shutdownTimeout)
+		defer cancel()
+	}
+
+	shutdownCh := make(chan struct{})
+	go func() {
+		i.changeQueque.ShutDownWithDrain()
+		shutdownCh <- struct{}{}
+	}()
+
+	select {
+	case <-stopCtx.Done():
+		if stopCtx.Err() != nil {
+			i.opts.logger.Error("[Infomer] shutdown timeout: %v", stopCtx.Err())
+		}
+		return stopCtx.Err()
+	case <-shutdownCh:
+		i.opts.logger.Info("[Infomer] shutdown success")
+		return nil
+	}
+}
+
+func (i *Infomer) enqueueIfTaskChange(ctx context.Context) error {
 	for {
-		select {
-		case <-ctx.Done():
-			// cancel signal watch.
-			stopCtx := context.Background()
-			// prepare timeout context if need.
-			if i.opts.shutdownTimeout > 0 {
-				var cancel context.CancelFunc
-				stopCtx, cancel = context.WithTimeout(stopCtx, w.opts.shutdownTimeout)
-				defer cancel()
-			}
-			// graceful shutdown.
-			return i.shutdown(stopCtx)
-		case <-execTicker.C:
-			i.enqueueIfTaskChange(ctx)
+		// load want and real task status
+		wantTaskRuns, err := i.loader.ListRunnableTasks(ctx, i.id)
+		if err != nil {
+			i.opts.logger.Error("[Infomer] load task failed: %v", err)
+			continue
+		}
+		realTasks := i.indexer.listRealTasks()
+
+		// diff get changes
+		changes := diff(wantTaskRuns, realTasks)
+		changesRaw, _ := json.Marshal(changes)
+		i.opts.logger.Info("[Infomer] 期望任务数(%d), 实际任务数(%d), 任务状态变化事件:%s", len(wantTaskRuns), len(realTasks), string(changesRaw))
+
+		// enqueue
+		for _, change := range changes {
+			i.changeQueque.Add(change)
+		}
+
+		// wait for next
+		time.Sleep(i.opts.runInterval)
+	}
+}
+
+func diff(wants []*model.TaskRun, reals []*model.Task) []*model.Change {
+	realMap := lo.KeyBy(reals, func(t *model.Task) string {
+		return t.TaskKey
+	})
+	wantMap := lo.KeyBy(wants, func(t *model.TaskRun) string {
+		return t.TaskKey
+	})
+
+	var transitions []*model.Change
+
+	// 1. check create or update
+	for _, want := range wants {
+		real, exists := realMap[want.TaskKey]
+		if !exists {
+			transitions = append(transitions, &model.Change{
+				TaskKey: want.TaskKey,
+				Real:    model.TaskStatusNotExist,
+				Want:    want.WantRunStatus,
+			})
+		} else if real.Status != want.WantRunStatus {
+			transitions = append(transitions, &model.Change{
+				TaskKey: want.TaskKey,
+				Real:    real.Status,
+				Want:    want.WantRunStatus,
+			})
 		}
 	}
-}
 
-func (i *Infomer) shutdown(ctx context.Context) error {
-}
-
-func (i *Infomer) enqueueIfTaskChange(ctx context.Context) {
-	wantTaskRuns, err := i.loadRunnableTasks(ctx)
-	if err != nil {
-		i.opts.logger.Error("Infomer[%s] 加载可执行任务失败: %v", i.id, err)
-		return
-	}
-	i.opts.logger.Info("Worker[%s] 加载到 %d 个可执行任务", i.id, len(wantTaskRuns))
-}
-
-func (i *Infomer) loadRunnableTasks(ctx context.Context) ([]*model.TaskRun, error) {
-	wantTaskRuns, err := i.loader.ListRunnableTasks(ctx, i.id)
-	if err != nil {
-		return nil, errors.WithStack(err)
+	// 2. check delete
+	for _, real := range reals {
+		if _, exists := wantMap[real.TaskKey]; !exists {
+			transitions = append(transitions, &model.Change{
+				TaskKey: real.TaskKey,
+				Real:    real.Status,
+				Want:    model.TaskStatusNotExist, // 假设有这个状态表示需要删除
+			})
+		}
 	}
 
-	// complete task status
-	// task 和 taskrun 需要一个统一的结构来承载数据，进行比较，思考一下（感觉）
-	realTasks := i.indexer.listRealTasks()
-	lo.Difference(wantTaskRuns, realTasks)
-
-	return taskRuns, nil
+	return transitions
 }
