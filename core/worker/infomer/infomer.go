@@ -122,9 +122,9 @@ func (i *Infomer) monitorChangeResult(ctx context.Context) {
 
 		if err := retry.Do(func() error {
 			if t.Status.IsFinalStatus() {
-				return i.recorder.FinishTaskTX(ctx, t)
+				return i.recorder.FinishTaskTX(context.Background(), t)
 			}
-			return i.recorder.UpdateTask(ctx, t)
+			return i.recorder.UpdateTask(context.Background(), t)
 		}); err != nil {
 			i.logger.Error("[Infomer] UpdateTask(%s) failed: %v", t.TaskKey, err)
 		}
